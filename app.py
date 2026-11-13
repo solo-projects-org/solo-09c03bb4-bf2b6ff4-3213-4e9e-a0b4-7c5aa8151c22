@@ -2,21 +2,31 @@
 
 from __future__ import annotations
 
+import io
 import os
 import re
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
-from flask import Flask, render_template, request
+from flask import (
+    Flask,
+    render_template,
+    request,
+    send_file,
+)
 
 from checker.engine import CheckResult, run_check
 from checker.errors import CheckError
 from checker.manifest import parse_manifest
+from checker.scrub import build_review_package, parse_query_tickets
 
 ROOT = Path(__file__).resolve().parent
 SAMPLE_DIR = ROOT / "sample"
 SAMPLE_TICKETS = "4242, 1003, 4218, 8888, 9999"
 SAMPLE_TICKET_COLUMN = "ticket_no"
+SCRUB_SAMPLE_TICKETS = "4242, 1003, 4218, 8888, 9999"
+SCRUB_MANIFEST_NAME = "scrub-manifest.csv"
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = (
@@ -74,6 +84,50 @@ def _sample_uploaded_paths(manifest) -> dict[str, Path]:
         if candidate.is_file():
             paths[entry.uploaded_filename] = candidate
     return paths
+
+
+def _scrub_sample_paths(manifest) -> dict[str, Path]:
+    paths: dict[str, Path] = {}
+    missing: list[str] = []
+    for entry in manifest.required_entries:
+        candidate = SAMPLE_DIR / entry.uploaded_filename
+        if candidate.is_file():
+            paths[entry.uploaded_filename] = candidate
+        else:
+            missing.append(entry.uploaded_filename)
+    if missing:
+        raise CheckError(
+            "内置复查样例缺少副本文件，无法生成复查包。", files=missing
+        )
+    return paths
+
+
+def _render_scrub(
+    *,
+    error: CheckError | None = None,
+    tickets_text: str = "",
+    status: int = 200,
+):
+    return (
+        render_template(
+            "scrub.html",
+            error=error,
+            tickets_text=tickets_text,
+            sample_tickets=SCRUB_SAMPLE_TICKETS,
+            max_upload_mb=app.config["MAX_CONTENT_LENGTH"] // (1024 * 1024),
+        ),
+        status,
+    )
+
+
+def _send_review_zip(package) -> bytes:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return send_file(
+        io.BytesIO(package.as_zip()),
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name=f"iceberg-review-package-{stamp}.zip",
+    )
 
 
 def _render(
@@ -175,6 +229,70 @@ def check():
         ticket_column=ticket_column,
         source="upload",
     )
+
+
+@app.get("/review")
+def review_page():
+    return _render_scrub()
+
+
+@app.get("/review/sample")
+def review_sample():
+    """Build a review package straight from the bundled local sample."""
+    try:
+        manifest_path = SAMPLE_DIR / SCRUB_MANIFEST_NAME
+        manifest_bytes = manifest_path.read_bytes()
+        manifest = parse_manifest(manifest_bytes)
+        package = build_review_package(
+            manifest_bytes,
+            _scrub_sample_paths(manifest),
+            parse_query_tickets(SCRUB_SAMPLE_TICKETS),
+        )
+    except CheckError as exc:
+        return _render_scrub(
+            error=exc,
+            tickets_text=SCRUB_SAMPLE_TICKETS,
+            status=400,
+        )
+    return _send_review_zip(package)
+
+
+@app.post("/review/package")
+def review_package():
+    tickets_text = request.form.get("tickets", "")
+    manifest_file = request.files.get("manifest")
+    parquet_files = request.files.getlist("files")
+
+    try:
+        tickets = parse_query_tickets(tickets_text)
+    except CheckError as exc:
+        return _render_scrub(
+            error=exc, tickets_text=tickets_text, status=400
+        )
+
+    if manifest_file is None or not manifest_file.filename:
+        return _render_scrub(
+            error=CheckError(
+                "请上传四列标准 Iceberg v2 CSV 清单（original_path、"
+                "uploaded_filename、file_type、data_sequence_number）。"
+            ),
+            tickets_text=tickets_text,
+            status=400,
+        )
+
+    try:
+        manifest_bytes = manifest_file.read()
+        with tempfile.TemporaryDirectory(prefix="iceberg-review-") as temp:
+            uploaded_paths = _save_uploads(parquet_files, Path(temp))
+            package = build_review_package(
+                manifest_bytes, uploaded_paths, tickets
+            )
+    except CheckError as exc:
+        return _render_scrub(
+            error=exc, tickets_text=tickets_text, status=400
+        )
+
+    return _send_review_zip(package)
 
 
 @app.errorhandler(413)

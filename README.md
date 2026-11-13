@@ -4,6 +4,10 @@
 （positional delete）标记。网页接收有效文件清单和对应 Parquet 副本，输入整数
 票号，逐条给出原文件、从 0 起算的文件内行号、是否已删除以及命中的删除文件。
 
+此外提供 **撤销票复查包** 入口：在不交出真实票据明细的前提下，生成一份可交给
+查询引擎供应商复查的合成样本（ZIP）。供应商解压后用同一个核查页查合成票号，
+跳过的行组、命中的原始行号与删票依据与替换前完全一致。
+
 ## 快速启动
 
 ```bash
@@ -96,6 +100,65 @@ JSON 也支持，顶层可以是数组，或包含 `files` / `entries` 数组的
   或任一文件打不开、行组读取失败，整次核对都会中止并明确列出文件名，不显示
   任何票号的部分结论。未出现在清单中的上传文件会被忽略并给出警告。
 
+## 撤销票复查包（合成脱敏）
+
+值班员要把样本交给查询引擎供应商复查撤销票，但不能交出真实票据明细。首页点
+**“撤销票复查包”**（路由 `/review`），上传四列标准 Iceberg v2 CSV 清单与
+Parquet 副本，输入待查票号，即可下载一个 ZIP 复查包。
+
+### 输入要求
+
+- 清单**仅支持 CSV**，且必须恰好包含四列、列名与顺序固定为
+  `original_path,uploaded_filename,file_type,data_sequence_number`；
+  JSON、缺列、多列、换序都会被拒绝。
+- 票号列固定为 `ticket_no`，源列类型必须是 **int64**；非空源票号与待查票号都
+  必须是**非负 int64**。负数是合成值的保留区间，源数据出现负数会被拒绝。
+- 清单**含等值删除（equality_delete）条目时拒绝**，不生成复查包。
+- 清单中每个 `data` / `position_delete` 条目都必须有对应 Parquet 副本，缺件、
+  文件损坏或读写失败都会说明原因且不发包。
+
+### 票号合成规则
+
+合成票号全部为负数，并保持严格的大小顺序（`x < y` ⇒ `合成(x) < 合成(y)`，
+相等值保持同一合成号），因此等值匹配、min/max 行组裁剪与跳读决策在复查时
+完全复现：
+
+- 每个待查票号换成**互不相同**的负数合成号；即使该票号在数据中不存在，也会
+  分配独立合成号并写入 `query-tickets.txt`。
+- 其余非空票号只按**相对待查票号的大小区间**替换：小于最小待查票号、落在相邻
+  两个待查票号之间、或大于最大待查票号；同一区间内的所有票号用同一个合成值。
+- 空值不参与替换，空值位置保持不变。
+
+### 副本与清单处理
+
+- **数据副本只保留 `ticket_no` 一列**：其余列（姓名、金额等真实明细）全部丢弃；
+  行数、行序、空值位置与行组边界（每个行组的行数）保持不变。
+- 每个数据文件内，非全空行组的票号 min/max 统计**全有或全无**：源文件有统计就
+  按原行组重新生成统计，源文件没有就整体不写统计；全空行组两侧都没有统计。
+- **删除副本只保留 `file_path` 和 `pos`** 两列，按原行组逐组复制；清单
+  **原样打包、不做任何修改**，因此删除匹配（路径 + 行号 + 序列号）结论不变。
+- 输出 Parquet 不携带任何源文件自定义键值元数据（含 `ARROW:schema`）。
+
+### ZIP 内容
+
+```text
+manifest.csv            与上传清单逐字节相同
+data-*.parquet          仅含 ticket_no 的合成数据副本
+delete-pos-*.parquet    仅含 file_path、pos 的删除副本
+query-tickets.txt       仅合成后的待查票号（每行一个负数）
+```
+
+包内**不含**任何原票号、原票号到合成号的映射表，也不含源 Parquet 自定义
+元数据。`uploaded_filename` 只能是不含路径分隔符的纯文件名，避免 ZIP 路径
+穿越；保留文件名 `manifest.csv`、`query-tickets.txt` 不允许被副本占用。
+
+### 供应商复查方式
+
+解压 ZIP 后，回到删除核对页（`/`），上传其中的清单与全部 Parquet 副本，票号
+填入 `query-tickets.txt` 里的合成号。每个合成票号跳过的行组、命中的原始行号
+（从 0 起算）以及命中/被忽略的删除文件依据，都与值班员替换前对原票号的核对
+结果一致。
+
 ## 内置样例
 
 `sample/` 中的演示数据由 `tools/make_sample.py` 生成：
@@ -115,6 +178,11 @@ JSON 也支持，顶层可以是数组，或包含 `files` / `entries` 数组的
 样例默认票号：`4242, 1003, 4218, 8888, 9999`。其中 1003 已删除，4218
 存在但未删除，9999 不存在。
 
+复查包流程使用同一份 Parquet 样例，但清单是
+`sample/scrub-manifest.csv`：它去掉了等值删除条目（复查流程拒绝等值删除），
+其余条目与 `manifest.csv` 相同。在 `/review` 页点 **“载入本地样例并下载
+复查包”**（路由 `/review/sample`）即可直接下载样例复查包。
+
 ## 本地开发与测试
 
 需要 Python 3.11+、Flask、PyArrow。
@@ -122,7 +190,7 @@ JSON 也支持，顶层可以是数组，或包含 `files` / `entries` 数组的
 ```bash
 python3 -m pip install -r requirements.txt
 python3 app.py                     # http://localhost:8000
-python3 -m pytest -q               # 36 个测试
+python3 -m pytest -q               # 68 个测试
 ```
 
 重新生成样例（会覆盖 `sample/` 下的 Parquet 和清单）：
@@ -134,13 +202,15 @@ python3 tools/make_sample.py
 ## 目录
 
 ```
-app.py                     Flask 路由、上传处理、票号解析
+app.py                     Flask 路由、上传处理、票号解析（含复查包路由）
 checker/manifest.py        清单解析与校验
 checker/engine.py          PyArrow 行组跳读、行号计算、位置删除匹配
+checker/scrub.py           票号合成映射、Parquet 脱敏重写、复查包 ZIP
 checker/errors.py          CheckError（始终带文件名）
-templates/index.html       网页
+templates/index.html       删除核对网页
+templates/scrub.html       复查包生成网页
 static/style.css           样式
-sample/                    内置样例（清单 + Parquet）
+sample/                    内置样例（清单 + Parquet + 复查专用清单）
 tools/make_sample.py       样例生成脚本
 tests/                     pytest 测试
 Dockerfile                 容器镜像

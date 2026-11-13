@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>渡轮结算 · 撤销票复查包生成</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header class="topbar">
+  <div class="wrap topbar-inner">
+    <div class="brand">
+      <span class="mark" aria-hidden="true">⛴</span>
+      <div>
+        <h1>渡轮结算 · 撤销票复查包</h1>
+        <p>Iceberg v2 清单与 Parquet 副本 · 票号合成脱敏 · 不含真实票据明细</p>
+      </div>
+    </div>
+    <a class="button ghost" href="{{ url_for('index') }}">返回删除核对页</a>
+  </div>
+</header>
+
+<main class="wrap">
+  {% if error %}
+  <section class="alert" role="alert">
+    <h2>复查包未生成</h2>
+    <p>{{ error.message }}</p>
+    {% if error.files %}
+    <p class="alert-files">涉及文件：</p>
+    <ul class="file-list">
+      {% for file in error.files %}<li class="mono">{{ file }}</li>{% endfor %}
+    </ul>
+    {% endif %}
+    <p class="hint">为避免泄露或产生不可复查的样本，本次没有发送任何压缩包。</p>
+  </section>
+  {% endif %}
+
+  <section class="card form-card">
+    <div class="card-head">
+      <h2>上传并生成复查包</h2>
+      <p class="subtle">
+        输出给查询引擎供应商的 ZIP：合成票号全部为负数，数据副本只保留
+        <code>ticket_no</code>（int64），删除副本只保留 <code>file_path</code>
+        与 <code>pos</code>，清单原样保留且不含等值删除。
+      </p>
+    </div>
+    <form method="post" action="{{ url_for('review_package') }}" enctype="multipart/form-data">
+      <div class="form-grid">
+        <label class="field">
+          <span class="field-label">四列标准 CSV 清单 <small>仅 CSV</small></span>
+          <input type="file" name="manifest" accept=".csv,text/csv" required>
+          <span class="field-hint">
+            列顺序固定：<code>original_path</code>、<code>uploaded_filename</code>、
+            <code>file_type</code>、<code>data_sequence_number</code>
+          </span>
+        </label>
+        <label class="field">
+          <span class="field-label">Parquet 副本 <small>可多选</small></span>
+          <input type="file" name="files" accept=".parquet,application/octet-stream" multiple>
+          <span class="field-hint">
+            清单中每个 <code>data</code> / <code>position_delete</code> 条目都要上传；
+            含 <code>equality_delete</code> 将拒绝
+          </span>
+        </label>
+      </div>
+
+      <div class="form-grid">
+        <label class="field">
+          <span class="field-label">待查票号 <small>非负 int64，逗号/空格/换行分隔</small></span>
+          <textarea name="tickets" rows="3" placeholder="4242, 1003, 4218">{{ tickets_text }}</textarea>
+          <span class="field-hint">
+            每个待查票号换成互不相同的负数合成号；其余非空票号按相对待查票号的
+            大小区间统一替换，空值与行序保持不变
+          </span>
+        </label>
+      </div>
+
+      <div class="form-actions">
+        <button class="button primary" type="submit">生成并下载 ZIP</button>
+        <a class="button ghost" href="{{ url_for('review_sample') }}">载入本地样例并下载复查包</a>
+        <span class="subtle limit">单次上传上限 {{ max_upload_mb }} MB</span>
+      </div>
+    </form>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>复查包内容与复查方式</h2>
+    </div>
+    <ul class="warnings">
+      <li>ZIP 内含原样 <code>manifest.csv</code>、脱敏后的 Parquet 副本，以及
+        <code>query-tickets.txt</code>（仅合成后的待查票号）。</li>
+      <li>不包含任何原票号、原票号到合成号的映射表，也不携带源 Parquet 自定义元数据。</li>
+      <li>数据副本仅保留 <code>ticket_no</code> 列；空值位置、行序、行数与行组边界不变。</li>
+      <li>每个数据文件内，非全空行组的票号 min/max 统计全有或全无；全空行组两侧均无统计。</li>
+      <li>解压后在“删除核对页”上传清单与副本、输入合成票号：每票跳过的行组、命中的原始
+        行号与删票依据与替换前完全一致。</li>
+    </ul>
+  </section>
+</main>
+
+<footer class="footer">
+  <div class="wrap">
+    <p>
+      缺件、输入不受支持或读写失败时页面会说明原因且不发送压缩包。
+      上传文件只保存在一次请求的临时目录中，请求结束后删除。
+    </p>
+  </div>
+</footer>
+</body>
+</html>
